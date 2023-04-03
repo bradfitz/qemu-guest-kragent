@@ -5,13 +5,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"io/fs"
 	"log"
+	"math"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -22,9 +27,15 @@ var debug = flag.Bool("debug", false, "print debug messages")
 func main() {
 	flag.Parse()
 	log.Printf("qemu-ga-go starting.")
-	// TODO(bradfitz): look for the /dev/vport whose /sys/devices/pci0000\:00/0000\:00\:08.0/virtio2/virtio-ports/vport2p1/name is "org.qemu.guest_agent.0".
-	// For now just hard-code what I see on gokrazy.
-	pf, err := os.OpenFile("/dev/vport2p1", os.O_RDWR, 0666)
+
+	dev, err := findGuestAgentDevice()
+	if err != nil {
+		log.Printf("error finding device: %v", err)
+		log.Printf("pausing process.")
+		time.Sleep(time.Duration(math.MaxInt64))
+	}
+	log.Printf("found qemu guest agent virtio-serial device at %v", dev)
+	pf, err := os.OpenFile(dev, os.O_RDWR, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -86,6 +97,37 @@ func main() {
 			log.Printf("Unhandled command %q", m.Execute)
 		}
 	}
+}
+
+func findGuestAgentDevice() (devName string, err error) {
+	// look for the /dev/vport files whose
+	// /sys/devices/pci0000\:00/0000\:00\:08.0/virtio2/virtio-ports/vport2p1/name
+	// is "org.qemu.guest_agent.0".
+	err = filepath.Walk("/sys/devices", func(path string, fi fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() || !strings.Contains(path, "/virtio-ports/vport") || !strings.HasSuffix(path, "/name") {
+			return nil
+		}
+		name, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		name = bytes.TrimSpace(name)
+		if string(name) != "org.qemu.guest_agent.0" {
+			return nil
+		}
+		devName = "/dev/" + filepath.Base(filepath.Dir(path)) // get parent directory's name ("vport2p1")
+		return nil
+	})
+	if devName != "" {
+		return devName, nil
+	}
+	if err == nil {
+		err = errors.New("no QEMU guest agent virtio-serial socket found; is it enabled in your hypervisor? is it virtio-serial?")
+	}
+	return "", err
 }
 
 func readAgentCharDevice(fd int) io.Reader {
