@@ -12,8 +12,9 @@ import (
 	"log"
 	"net"
 	"os"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 var debug = flag.Bool("debug", false, "print debug messages")
@@ -23,7 +24,7 @@ func main() {
 	log.Printf("qemu-ga-go starting.")
 	// TODO(bradfitz): look for the /dev/vport whose /sys/devices/pci0000\:00/0000\:00\:08.0/virtio2/virtio-ports/vport2p1/name is "org.qemu.guest_agent.0".
 	// For now just hard-code what I see on gokrazy.
-	pf, err := os.OpenFile("/dev/vport2p1", syscall.O_RDWR, 0666)
+	pf, err := os.OpenFile("/dev/vport2p1", os.O_RDWR, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,11 +73,11 @@ func main() {
 			var err error
 			switch m.Arguments.Mode {
 			case "", "powerdown":
-				err = syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
+				err = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
 			case "reboot":
-				err = syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
+				err = unix.Reboot(unix.LINUX_REBOOT_CMD_RESTART)
 			case "halt":
-				err = syscall.Reboot(syscall.LINUX_REBOOT_CMD_HALT)
+				err = unix.Reboot(unix.LINUX_REBOOT_CMD_HALT)
 			default:
 				err = errors.New("invalid shutdown mode")
 			}
@@ -88,39 +89,65 @@ func main() {
 }
 
 func readAgentCharDevice(fd int) io.Reader {
-	if err := syscall.SetNonblock(int(fd), false); err != nil {
+	if err := unix.SetNonblock(int(fd), false); err != nil {
 		log.Fatal(err)
 	}
 	pr, pw := io.Pipe()
 	go func() {
-		epfd, err := syscall.EpollCreate1(0)
+		epfd, err := unix.EpollCreate1(0)
 		if err != nil {
 			log.Fatalf("EpollCreate1: %v", err)
 		}
-		defer syscall.Close(epfd)
+		defer unix.Close(epfd)
 		defer pw.CloseWithError(errors.New("reader ended"))
 
-		evt := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}
-		if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd, &evt); err != nil {
+		// Note that it's important to use edge-triggered epoll here. When the
+		// hypervisor host side of the virtio-serial is not present (or not
+		// reading?), the epoll readability of our file descriptor is 17:
+		// EPOLLIN & EPOLLHUP. With level-triggered epoll, we'd spin forever
+		// because HUP means it's always readable. What we used to do (and the
+		// official qemu-guest-agent seems to still do as of 2023-04-03) is just
+		// spin but with a sleep in the middle. So it's the worst of both
+		// worlds: you're still wasting CPU (but more slowly), and you now also
+		// have latency from qemu agent queries from the host since you're stuck
+		// in a sleep most the time, not blocking in an epoll_wait where we want
+		// to be.  With this way, we block in epoll_wait, get a epoll_wait
+		// event with "Events: 1" (readable) on our fd, then read it to exhaustion,
+		// epoll_wait again, get "Events: 17" (readable + hup), read again,
+		// get nothing (0, nil), and go back into epoll_wait. Here edge triggered
+		// saves the day: it blocks until we change from IN|HUP to something else,
+		// usually back to just readable (without HUP) and we continue.
+		evt := unix.EpollEvent{
+			Events: unix.EPOLLIN | unix.EPOLLET,
+			Fd:     int32(fd),
+		}
+		if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, fd, &evt); err != nil {
 			log.Fatalf("EpollCtl: %v", err)
 		}
 
-		events := make([]syscall.EpollEvent, 1)
+		events := make([]unix.EpollEvent, 1)
 		buf := make([]byte, 1024)
 		for {
-			n, err := syscall.EpollWait(epfd, events, -1)
+			n, err := unix.EpollWait(epfd, events, -1)
 			if err != nil {
 				log.Fatalf("EpollWait: %v", err)
 			}
 			if n == 0 {
 				log.Fatalf("unexpected 0 epollwait")
 			}
+			if *debug {
+				log.Printf("epoll_wait: %+v", events[0])
+			}
 			for {
-				n, err := syscall.Read(fd, buf)
-				if n > 0 {
-					if *debug {
-						log.Printf("Read: (%v, %v): %q", n, err, buf[:n])
+				n, err := unix.Read(fd, buf)
+				if *debug {
+					var logBuf []byte
+					if n >= 0 {
+						logBuf = buf[:n]
 					}
+					log.Printf("read: (%v, %v): %q", n, err, logBuf)
+				}
+				if n > 0 {
 					if _, err := pw.Write(buf[:n]); err != nil {
 						log.Fatalf("pipe write: %v", err)
 						return
@@ -129,12 +156,6 @@ func readAgentCharDevice(fd int) io.Reader {
 				}
 				if err != nil {
 					log.Fatalf("Read: %v", err)
-				}
-				// virtio-serial sucks and just spins with epoll saying it's readable
-				// (well, EPOLLIN|EPOLLHUP) if nothing on the host has it open. So
-				// just sleep so we don't burn CPU.
-				if events[0].Events&syscall.EPOLLHUP != 0 {
-					time.Sleep(time.Second)
 				}
 				break
 			}
