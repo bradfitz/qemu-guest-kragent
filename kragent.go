@@ -55,6 +55,9 @@ func main() {
 		if *debug {
 			log.Printf("Got message: %+v", m)
 		}
+
+		// Check the QEMU Guest Agent Protocol Reference
+		// for how to handle commands: https://qemu-project.gitlab.io/qemu/interop/qemu-ga-ref.html
 		switch m.Execute {
 		case "guest-sync-delimited":
 			bw.WriteByte(0xff)
@@ -93,6 +96,37 @@ func main() {
 				err = errors.New("invalid shutdown mode")
 			}
 			log.Printf("Reboot for mode %q = %v", m.Arguments.Mode, err)
+		case "guest-fsfreeze-freeze":
+			count, err := fsfreezeFreeze()
+			if err != nil {
+				log.Printf("Unable to fsfreeze-freeze the filesystems: %v", err)
+				// On error, all filesystems will be thawed back.
+				// If no filesystems are frozen as a result of this call,
+				// then guest-fsfreeze-status will remain “thawed” and calling guest-fsfreeze-thaw is not necessary.
+				if _, err := fsfreezeThaw(); err != nil {
+					log.Printf("Unable to fsfreeze-thaw the previously frozen filesystems after a freeze failure: %v", err)
+				}
+				je.Encode(Return{0})
+				bw.Flush()
+				break
+			}
+			guestFsfreezeStatus = guestFsfreezeStatusFrozen
+			je.Encode(Return{count})
+			bw.Flush()
+		case "guest-fsfreeze-thaw":
+			count, err := fsfreezeThaw()
+			if err != nil {
+				log.Printf("Unable to fsfreeze-thaw the previously frozen filesystems: %v", err)
+				je.Encode(Return{0})
+				bw.Flush()
+				break
+			}
+			guestFsfreezeStatus = guestFsfreezeStatusThawed
+			je.Encode(Return{count})
+			bw.Flush()
+		case "guest-fsfreeze-status":
+			je.Encode(Return{guestFsfreezeStatus})
+			bw.Flush()
 		default:
 			log.Printf("Unhandled command %q", m.Execute)
 		}
